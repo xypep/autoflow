@@ -303,6 +303,19 @@ ResolveVar(val) {
     return val
 }
 
+; Replace every "$varname" inside a text with its stored value.
+; Unknown names are left untouched so literal text like "$5" survives.
+ExpandVars(text) {
+    global varStore
+    out := "", pos := 1
+    while (found := RegExMatch(text, "\$(\w+)", &m, pos)) {
+        out .= SubStr(text, pos, found - pos)
+        out .= varStore.Has(m[1]) ? varStore[m[1]] : m[0]
+        pos := found + m.Len[0]
+    }
+    return out . SubStr(text, pos)
+}
+
 ; --- Safe conversion / execution helpers --------------------------------
 ; Integer with fallback — never throws on empty or non-numeric input
 SafeInt(val, default := 0) {
@@ -1232,7 +1245,6 @@ AddAction(*) {
         MsgBox("Please select a valid action type!", "Error", "Icon!")
         return
     }
-    ActionType.Add(AllActionTypes)
     raw   := Trim(ActionValue.Text)
     delay := Trim(ActionDelay.Value)
     if (!IsAutoType(type) && (raw = "" || raw = "(automatic)")) {
@@ -1532,6 +1544,12 @@ EditAction(LV, row) {
 
     DoSave(*) {
         rawVal := dValue.Text
+        ; Validate before Submit() so the dialog stays open on bad input
+        delay := Trim(dDelay.Value)
+        if (!IsInteger(delay) || Integer(delay) < 0) {
+            MsgBox("Delay must be a positive number!", "Error", "Icon! Owner" D.Hwnd)
+            return
+        }
         saved  := D.Submit()
         t := saved.Type
         if (IsSeparator(t)) {
@@ -1556,8 +1574,8 @@ EditAction(LV, row) {
         actionList[row].type  := t
         actionList[row].value := v
         actionList[row].mods  := m
-        actionList[row].delay := Integer(saved.Delay)
-        ListView.Modify(row, "", row, t, BuildDisplay(t, v, m), saved.Delay)
+        actionList[row].delay := Integer(delay)
+        ListView.Modify(row, "", row, t, BuildDisplay(t, v, m), Integer(delay))
         D.Destroy()
     }
 }
@@ -1873,12 +1891,12 @@ DoNotification(raw) {
     ; Format: title | message | sound    (sound optional → defaults to "notify")
     parts := StrSplit(raw, "|")
     if (parts.Length >= 2) {
-        title := Trim(ResolveVar(parts[1]))
-        msg   := Trim(ResolveVar(parts[2]))
+        title := ExpandVars(Trim(parts[1]))
+        msg   := ExpandVars(Trim(parts[2]))
         sound := (parts.Length >= 3 && Trim(parts[3]) != "") ? Trim(parts[3]) : "notify"
     } else {
         title := "Key Flow"
-        msg   := Trim(ResolveVar(raw))
+        msg   := ExpandVars(Trim(raw))
         sound := "notify"
     }
     ShowToast(title, msg, 3000, sound)
@@ -2128,9 +2146,11 @@ PauseAuto(*) {
 
 StopAuto(*) {
     global isRunning, isPaused, runLoop, StatusLabel
+    ; Only signal the loop to end. isRunning is reset by RunActions itself once
+    ; the current action has finished — resetting it here would let F6 start a
+    ; second RunActions while the old one is still stuck in a Sleep/Wait.
     runLoop   := false
     isPaused  := false
-    isRunning := false
     StatusLabel.Text := "STOPPED"
     StatusLabel.Opt("BackgroundFF3355")
     DestroyOSD()
