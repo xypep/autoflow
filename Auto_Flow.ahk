@@ -199,6 +199,9 @@ global FriendlyApps := Map(
 IsAutoType(t)     => InStr(AutoTypes,     t) > 0
 IsModifierType(t) => InStr(ModifierTypes, t) > 0
 IsSeparator(t)    => SubStr(t, 1, 4) = "━━━━"
+; Var types whose first field is the variable name they write to
+IsVarWriteType(t) => (t = "📊 Var: Set" || t = "📊 Var: Add" || t = "📊 Var: Sub"
+                   || t = "📊 Var: Set If" || t = "📊 Var: Random")
 
 ; Scan actionList for every variable name already in use, then build
 ; dropdown entries for the given Var type.  Falls back to one example
@@ -209,7 +212,7 @@ BuildVarPresets(type) {
     varNames := []
     for a in actionList {
         t := a.type
-        if (t = "📊 Var: Set" || t = "📊 Var: Add" || t = "📊 Var: Sub" || t = "📊 Var: Set If" || t = "📊 Var: Random") {
+        if (IsVarWriteType(t)) {
             sep  := InStr(a.value, "|")
             name := sep > 0 ? Trim(SubStr(a.value, 1, sep - 1)) : Trim(a.value)
             if (name != "" && !seen.Has(name)) {
@@ -218,33 +221,22 @@ BuildVarPresets(type) {
             }
         }
     }
+    ; type → [suffix per known variable, fallback entry when none exist]
+    static formats := Map(
+        "📊 Var: Set",    ["|0",      "counter|0"],
+        "📊 Var: Add",    ["|1",      "counter|1"],
+        "📊 Var: Sub",    ["|1",      "counter|1"],
+        "📊 Var: Set If", ["|==|0|0", "counter|==|10|0"],
+        "📊 Var: Random", ["|1|100",  "counter|1|100"]
+    )
     entries := []
-    if (type = "📊 Var: Set") {
-        for n in varNames
-            entries.Push(n "|0")
-        if (varNames.Length = 0)
-            entries.Push("counter|0")
-    } else if (type = "📊 Var: Add") {
-        for n in varNames
-            entries.Push(n "|1")
-        if (varNames.Length = 0)
-            entries.Push("counter|1")
-    } else if (type = "📊 Var: Sub") {
-        for n in varNames
-            entries.Push(n "|1")
-        if (varNames.Length = 0)
-            entries.Push("counter|1")
-    } else if (type = "📊 Var: Set If") {
-        for n in varNames
-            entries.Push(n "|==|0|0")
-        if (varNames.Length = 0)
-            entries.Push("counter|==|10|0")
-    } else if (type = "📊 Var: Random") {
-        for n in varNames
-            entries.Push(n "|1|100")
-        if (varNames.Length = 0)
-            entries.Push("counter|1|100")
-    }
+    if (!formats.Has(type))
+        return entries
+    fmt := formats[type]
+    for n in varNames
+        entries.Push(n fmt[1])
+    if (varNames.Length = 0)
+        entries.Push(fmt[2])
     return entries
 }
 
@@ -348,7 +340,12 @@ SafeRun(target, args*) {
 
 ; Build modifier string from checkboxes (main GUI)
 BuildMods() {
-    return (ChkCtrl.Value ? "^" : "") . (ChkAlt.Value ? "!" : "") . (ChkShift.Value ? "+" : "") . (ChkWin.Value ? "#" : "")
+    return ModsFromFlags(ChkCtrl.Value, ChkAlt.Value, ChkShift.Value, ChkWin.Value)
+}
+
+; Ctrl/Alt/Shift/Win flags → AHK modifier prefix ("^!+#")
+ModsFromFlags(ctrl, alt, shift, win) {
+    return (ctrl ? "^" : "") . (alt ? "!" : "") . (shift ? "+" : "") . (win ? "#" : "")
 }
 
 ; Build readable display string for the ListView
@@ -464,6 +461,23 @@ ToAhk(type, value, mods) {
     return value
 }
 
+; Unique process names of all windows (AutoHotkey itself excluded)
+GetWindowProcesses() {
+    procs := []
+    seen  := Map()
+    for hwnd in WinGetList() {
+        try {
+            proc := WinGetProcessName(hwnd)
+            if (proc != "" && !seen.Has(proc)
+                && proc != "AutoHotkey64.exe" && proc != "AutoHotkey32.exe") {
+                seen[proc] := true
+                procs.Push(proc)
+            }
+        }
+    }
+    return procs
+}
+
 ; Full unfiltered list for the current type — used by search filter
 global valueFullList := []
 
@@ -512,17 +526,8 @@ PopulateValues(cb) {
     ; --- Window actions: visible-window processes ---
     } else if (InStr(type, "Window")) {
         items.Push("Current Window")
-        seen := Map()
-        for hwnd in WinGetList() {
-            try {
-                proc := WinGetProcessName(hwnd)
-                if (proc != "" && !seen.Has(proc)
-                    && proc != "AutoHotkey64.exe" && proc != "AutoHotkey32.exe") {
-                    seen[proc] := true
-                    items.Push(proc)
-                }
-            }
-        }
+        for proc in GetWindowProcesses()
+            items.Push(proc)
 
     ; --- Kill Process: all processes via WMI with full path ---
     } else if (type = "🔫 Kill Process") {
@@ -690,20 +695,14 @@ global colorPickMode  := "ANY"   ; "ANY" or "AVG"
 MyGui.SetFont("s8 c555577")
 global LblColorHint   := MyGui.Add("Text", "x346 y149 w500", "🎨 Pick = choose color   |   Shift+Scroll = resize region   |   Tab = toggle mode")
 
-; All hidden by default — OnTypeChange will show the right row
-LblModRow.Visible       := false
-ChkCtrl.Visible         := false
-ChkAlt.Visible          := false
-ChkShift.Visible        := false
-ChkWin.Visible          := false
-LblSymbols.Visible      := false
-LblCaptureRow.Visible   := false
-BtnCapture.Visible      := false
-LblCaptureHint.Visible  := false
-LblColorRow.Visible     := false
-BtnPickColor.Visible    := false
-BtnColorMode.Visible    := false
-LblColorHint.Visible    := false
+; Optional rows as [control, y-offset relative to the row] groups.
+; All hidden by default — OnTypeChange will show the right row.
+global ModRowCtrls     := [[LblModRow, 0], [ChkCtrl, -2], [ChkAlt, -2], [ChkShift, -2], [ChkWin, -2], [LblSymbols, 1]]
+global CaptureRowCtrls := [[LblCaptureRow, 0], [BtnCapture, -4], [LblCaptureHint, 1]]
+global ColorRowCtrls   := [[LblColorRow, 0], [BtnPickColor, -4], [BtnColorMode, -4], [LblColorHint, 1]]
+ShowRow(ModRowCtrls,     false)
+ShowRow(CaptureRowCtrls, false)
+ShowRow(ColorRowCtrls,   false)
 
 MyGui.Add("Text", "x0 y202 w1079 h1 Background2D2D4A")
 
@@ -969,7 +968,6 @@ StartColorPick(*) {
     cpZoomGui.BackColor := "1A1A2E"
     cpZoomGui.MarginX := 0
     cpZoomGui.MarginY := 0
-    canvasSize := CP_CANVAS + 30
     cpZoomGui.Show("w" CP_CANVAS " h" (CP_CANVAS + 30) " NoActivate")
 
     ; Canvas picture control (will be painted via GDI)
@@ -1134,15 +1132,21 @@ ColorPickCleanup() {
     cpZoomGui := ""
 }
 
+; Types whose value can be picked with the 📂 file dialog
+HasBrowse(t) => (t = "🚀 Open Program" || t = "🔍 Find Image" || t = "🔫 Kill Process")
+
+; Show the file dialog matching the action type; returns "" on cancel
+BrowseFileFor(type) {
+    if (type = "🔍 Find Image")
+        return FileSelect("3", , "Select an image file", "Image Files (*.png; *.bmp; *.gif)")
+    if (type = "📜 Run PowerShell")
+        return FileSelect("3", , "Select a PowerShell script", "PowerShell Script (*.ps1)")
+    return FileSelect("3", , "Select a program to open", "Programs (*.exe)")
+}
+
 BrowseForExe(*) {
     global ActionValue, ActionType
-    type := ActionType.Text
-    if (type = "🔍 Find Image")
-        path := FileSelect("3", , "Select an image file", "Image Files (*.png; *.bmp; *.gif)")
-    else if (type = "📜 Run PowerShell")
-        path := FileSelect("3", , "Select a PowerShell script", "PowerShell Script (*.ps1)")
-    else
-        path := FileSelect("3", , "Select a program to open", "Programs (*.exe)")
+    path := BrowseFileFor(ActionType.Text)
     if (path != "")
         ActionValue.Text := path
 }
@@ -1176,37 +1180,11 @@ OnTypeChange(*) {
 
     ; Modifier/capture/color rows sit at y=146 normally, or y=170 when hint is showing
     rowY := (hint != "") ? 170 : 146
-    LblModRow.Move(, rowY)
-    ChkCtrl.Move(,    rowY - 2)
-    ChkAlt.Move(,     rowY - 2)
-    ChkShift.Move(,   rowY - 2)
-    ChkWin.Move(,     rowY - 2)
-    LblSymbols.Move(, rowY + 1)
-    LblCaptureRow.Move(,  rowY)
-    BtnCapture.Move(,     rowY - 4)
-    LblCaptureHint.Move(, rowY + 1)
-    LblColorRow.Move(,    rowY)
-    BtnPickColor.Move(,   rowY - 4)
-    BtnColorMode.Move(,   rowY - 4)
-    LblColorHint.Move(,   rowY + 1)
+    ShowRow(ModRowCtrls,     showMod,     rowY)
+    ShowRow(CaptureRowCtrls, isMouseType, rowY)
+    ShowRow(ColorRowCtrls,   isColorType, rowY)
 
-    LblModRow.Visible  := showMod
-    ChkCtrl.Visible    := showMod
-    ChkAlt.Visible     := showMod
-    ChkShift.Visible   := showMod
-    ChkWin.Visible     := showMod
-    LblSymbols.Visible := showMod
-
-    LblCaptureRow.Visible  := isMouseType
-    BtnCapture.Visible     := isMouseType
-    LblCaptureHint.Visible := isMouseType
-
-    LblColorRow.Visible    := isColorType
-    BtnPickColor.Visible   := isColorType
-    BtnColorMode.Visible   := isColorType
-    LblColorHint.Visible   := isColorType
-
-    BtnBrowse.Visible      := (type = "🚀 Open Program" || type = "🔍 Find Image" || type = "🔫 Kill Process")
+    BtnBrowse.Visible      := HasBrowse(type)
 
     ; Enable live search for types with large/dynamic lists
     global isSearchableType, lastSearchText
@@ -1226,6 +1204,15 @@ OnTypeChange(*) {
     ChkWin.Value   := 0
     LblSymbols.Text := ""
     PopulateValues(ActionValue)
+}
+
+; Show/hide a control group and (optionally) move it to row position y
+ShowRow(ctrls, show, y := "") {
+    for c in ctrls {
+        if (y != "")
+            c[1].Move(, y + c[2])
+        c[1].Visible := show
+    }
 }
 
 TrackRow(LV, row, *) {
@@ -1259,8 +1246,7 @@ AddAction(*) {
     value := IsAutoType(type) ? "(auto)" : raw
 
     SaveSnapshot()
-    actionList.Push({ type: type, value: value, mods: mods, delay: Integer(delay) })
-    ListView.Add("", actionList.Length, type, BuildDisplay(type, value, mods), delay)
+    AppendAction({ type: type, value: value, mods: mods, delay: Integer(delay) })
 }
 
 DelRow(*) {
@@ -1288,36 +1274,32 @@ ClearAll(*) {
     }
 }
 
-MoveUp(*) {
+MoveUp(*)   => MoveFocusedRow(-1)
+MoveDown(*) => MoveFocusedRow(+1)
+
+; Swap the focused row with its neighbour (dir = -1 up, +1 down)
+MoveFocusedRow(dir) {
     global actionList, ListView, selectedRow
-    row := ListView.GetNext(0, "Focused")
-    if (!row || row = 1) {
+    row    := ListView.GetNext(0, "Focused")
+    target := row + dir
+    if (!row || target < 1 || target > actionList.Length) {
         return
     }
     SaveSnapshot()
-    tmp               := actionList[row]
-    actionList[row]   := actionList[row-1]
-    actionList[row-1] := tmp
-    UpdateRow(row-1)
+    tmp                  := actionList[row]
+    actionList[row]      := actionList[target]
+    actionList[target]   := tmp
     UpdateRow(row)
-    selectedRow := row-1
-    ListView.Modify(row-1, "Select Focus Vis")
+    UpdateRow(target)
+    selectedRow := target
+    ListView.Modify(target, "Select Focus Vis")
 }
 
-MoveDown(*) {
-    global actionList, ListView, selectedRow
-    row := ListView.GetNext(0, "Focused")
-    if (!row || row = actionList.Length) {
-        return
-    }
-    SaveSnapshot()
-    tmp               := actionList[row]
-    actionList[row]   := actionList[row+1]
-    actionList[row+1] := tmp
-    UpdateRow(row)
-    UpdateRow(row+1)
-    selectedRow := row+1
-    ListView.Modify(row+1, "Select Focus Vis")
+; Append an action to actionList and add its ListView row
+AppendAction(a) {
+    global actionList, ListView
+    actionList.Push(a)
+    ListView.Add("", actionList.Length, a.type, BuildDisplay(a.type, a.value, a.mods), a.delay)
 }
 
 ; Update a single ListView row from actionList without full rebuild
@@ -1386,7 +1368,7 @@ EditAction(LV, row) {
     D.Add("Text", "x10 y112", "Value:")
     dValue  := D.Add("ComboBox", "x10 y130 w295 vValue Background1E1E32 c8899BB", [])
     dBrowse := D.Add("Button",   "x308 y128 w42 h26", "📂")
-    dBrowse.Visible := (a.type = "🚀 Open Program" || a.type = "🔍 Find Image")
+    dBrowse.Visible := HasBrowse(a.type)
     dBrowse.OnEvent("Click", DoBrowse)
     RefillDValues(a.type)
     ; For Notification, the 3rd field (sound) lives in its own dropdown —
@@ -1431,11 +1413,7 @@ EditAction(LV, row) {
     D.Show("w360 h348")
 
     DoBrowse(*) {
-        t := dType.Text
-        if (t = "🔍 Find Image")
-            p := FileSelect("3",,"Select an image file","Image Files (*.png; *.bmp; *.gif)")
-        else
-            p := FileSelect("3",,"Select a program","Programs (*.exe)")
+        p := BrowseFileFor(dType.Text)
         if (p != "")
             dValue.Text := p
     }
@@ -1482,7 +1460,7 @@ EditAction(LV, row) {
     }
 
     RefreshDSyms(*) {
-        m := (dCtrl.Value ? "^" : "") . (dAlt.Value ? "!" : "") . (dShift.Value ? "+" : "") . (dWin.Value ? "#" : "")
+        m := ModsFromFlags(dCtrl.Value, dAlt.Value, dShift.Value, dWin.Value)
         dSyms.Text := (m = "") ? "" : "[" m "]"
     }
 
@@ -1502,16 +1480,8 @@ EditAction(LV, row) {
             try dValue.Choose(1)
         } else if (InStr(t, "Window")) {
             dValue.Add(["Current Window"])
-            seen := Map()
-            for hwnd in WinGetList() {
-                try {
-                    proc := WinGetProcessName(hwnd)
-                    if (proc != "" && !seen.Has(proc) && proc != "AutoHotkey64.exe" && proc != "AutoHotkey32.exe") {
-                        seen[proc] := true
-                        dValue.Add([proc])
-                    }
-                }
-            }
+            for proc in GetWindowProcesses()
+                dValue.Add([proc])
             try dValue.Choose(1)
         } else if (InStr(t, "📊 Var:")) {
             presets := BuildVarPresets(t)
@@ -1538,7 +1508,7 @@ EditAction(LV, row) {
         h := HintForType(t)
         dHint.Text    := h
         dHint.Visible := (h != "")
-        dBrowse.Visible := (t = "🚀 Open Program" || t = "🔍 Find Image")
+        dBrowse.Visible := HasBrowse(t)
         ShowSoundRow(t = "🔔 Notification")
     }
 
@@ -1556,7 +1526,7 @@ EditAction(LV, row) {
             return
         }
         SaveSnapshot()
-        m := (saved.Ctrl ? "^" : "") . (saved.Alt ? "!" : "") . (saved.Shift ? "+" : "") . (saved.Win ? "#" : "")
+        m := ModsFromFlags(saved.Ctrl, saved.Alt, saved.Shift, saved.Win)
         v := IsAutoType(t) ? "(auto)" : rawVal
 
         ; For Notification, attach the chosen sound as the 3rd field:
@@ -2160,12 +2130,18 @@ StopAuto(*) {
 ;   Undo / Redo
 ; =============================================
 
-SaveSnapshot() {
-    global undoStack, redoStack, actionList
+; Deep copy of the action list (used for undo/redo snapshots)
+CloneActions() {
+    global actionList
     snap := []
     for a in actionList
         snap.Push({ type: a.type, value: a.value, mods: (a.HasOwnProp("mods") ? a.mods : ""), delay: a.delay })
-    undoStack.Push(snap)
+    return snap
+}
+
+SaveSnapshot() {
+    global undoStack, redoStack
+    undoStack.Push(CloneActions())
     if (undoStack.Length > 50)
         undoStack.RemoveAt(1)
     redoStack := []
@@ -2175,10 +2151,7 @@ Undo(*) {
     global undoStack, redoStack, actionList
     if (undoStack.Length = 0)
         return
-    snap := []
-    for a in actionList
-        snap.Push({ type: a.type, value: a.value, mods: (a.HasOwnProp("mods") ? a.mods : ""), delay: a.delay })
-    redoStack.Push(snap)
+    redoStack.Push(CloneActions())
     actionList := undoStack.Pop()
     RebuildList()
 }
@@ -2187,10 +2160,7 @@ Redo(*) {
     global undoStack, redoStack, actionList
     if (redoStack.Length = 0)
         return
-    snap := []
-    for a in actionList
-        snap.Push({ type: a.type, value: a.value, mods: (a.HasOwnProp("mods") ? a.mods : ""), delay: a.delay })
-    undoStack.Push(snap)
+    undoStack.Push(CloneActions())
     actionList := redoStack.Pop()
     RebuildList()
 }
@@ -2208,7 +2178,7 @@ StripEmoji(s) {
 FindType(plain) {
     global AllActionTypes
     for t in AllActionTypes {
-        if (Trim(RegExReplace(t, "^[^\x00-\x7F]+\s*", "")) = plain)
+        if (StripEmoji(t) = plain)
             return t
     }
     return plain
@@ -2286,8 +2256,7 @@ LoadProfile(*) {
                 val   := old[2]
                 delay := IsInteger(old[3]) ? Integer(old[3]) : 0
                 mods  := (old.Length >= 4) ? old[4] : ""
-                actionList.Push({ type: t, value: val, delay: delay, mods: mods })
-                ListView.Add("", actionList.Length, t, BuildDisplay(t, val, mods), delay)
+                AppendAction({ type: t, value: val, delay: delay, mods: mods })
             }
             continue
         }
@@ -2298,8 +2267,7 @@ LoadProfile(*) {
             delay := IsInteger(parts[2]) ? Integer(parts[2]) : 0
             mods  := isV2 ? UnescapeField(parts[3]) : parts[3]
             val   := isV2 ? UnescapeField(parts[4]) : parts[4]
-            actionList.Push({ type: t, value: val, delay: delay, mods: mods })
-            ListView.Add("", actionList.Length, t, BuildDisplay(t, val, mods), delay)
+            AppendAction({ type: t, value: val, delay: delay, mods: mods })
         }
     }
     MsgBox("Loaded " actionList.Length " actions.", "Success", "Icon!")
@@ -2318,10 +2286,8 @@ LoadExamples() {
         { type: "🔽 Scroll Down",value: "3 ticks",      mods: "",  delay: 300  },
         { type: "⏳ Wait (ms)",   value: "2000 ms",      mods: "",  delay: 0    },
     ]
-    for a in examples {
-        actionList.Push(a)
-        ListView.Add("", actionList.Length, a.type, BuildDisplay(a.type, a.value, a.mods), a.delay)
-    }
+    for a in examples
+        AppendAction(a)
 }
 
 ; =============================================
@@ -2351,8 +2317,7 @@ UpdateOSD(actionType, repCur, repMax) {
     global osdGui, osdActionLbl, osdRepeatLbl
     if (!IsObject(osdGui))
         return
-    plain := Trim(RegExReplace(actionType, "^[^\x00-\x7F]+\s*", ""))
-    osdActionLbl.Text := "Action: " plain
+    osdActionLbl.Text := "Action: " StripEmoji(actionType)
     osdRepeatLbl.Text := "Rep: " repCur " / " (repMax = 0 ? "∞" : repMax)
 }
 
@@ -2368,7 +2333,7 @@ DestroyOSD() {
 ; =============================================
 
 StartRecording(*) {
-    global isRecording, isRunning, MyGui
+    global isRecording, isRunning, MyGui, recHook
     if (isRunning) {
         MsgBox("Stop the sequence before recording!", "Error", "Icon!")
         return
@@ -2401,9 +2366,7 @@ RecordLoop() {
         MouseGetPos(&rx, &ry)
         KeyWait("LButton")
         coords := rx " " ry
-        actionList.Push({ type: "🖱️ Left Click", value: coords, mods: "", delay: 500 })
-        ListView.Add("", actionList.Length, "🖱️ Left Click",
-            BuildDisplay("🖱️ Left Click", coords, ""), 500)
+        AppendAction({ type: "🖱️ Left Click", value: coords, mods: "", delay: 500 })
         ToolTip("⏺ Captured: " coords "  (" actionList.Length " total)`nPress ESC to stop.", 10, 10, 3)
     }
 }
@@ -2424,9 +2387,7 @@ RecordKeyDown(ih, vk, sc) {
     if (GetKeyState("Alt",   "P")) mods .= "!"
     if (GetKeyState("Shift", "P")) mods .= "+"
     if (GetKeyState("LWin",  "P") || GetKeyState("RWin", "P")) mods .= "#"
-    actionList.Push({ type: "⌨️ Press Key", value: keyName, mods: mods, delay: 100 })
-    ListView.Add("", actionList.Length, "⌨️ Press Key",
-        BuildDisplay("⌨️ Press Key", keyName, mods), 100)
+    AppendAction({ type: "⌨️ Press Key", value: keyName, mods: mods, delay: 100 })
     ToolTip("⏺ Recorded: " mods keyName "  (" actionList.Length " total)`nPress ESC to stop.", 10, 10, 3)
 }
 
